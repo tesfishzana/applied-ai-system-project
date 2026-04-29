@@ -136,11 +136,11 @@ st.caption(
     "I'll find the best tracks and explain exactly why they fit."
 )
 
-if not os.environ.get("ANTHROPIC_API_KEY"):
+if not os.environ.get("GEMINI_API_KEY"):
     st.error(
-        "**ANTHROPIC_API_KEY is not set.**\n\n"
-        "```\nexport ANTHROPIC_API_KEY=sk-ant-...\nstreamlit run app.py\n```\n"
-        "Or create a `.env` file:\n```\nANTHROPIC_API_KEY=sk-ant-...\n```"
+        "**GEMINI_API_KEY is not set.**\n\n"
+        "```\nexport GEMINI_API_KEY=AIza...\nstreamlit run app.py\n```\n"
+        "Or create a `.env` file:\n```\nGEMINI_API_KEY=AIza...\n```"
     )
     st.stop()
 

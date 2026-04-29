@@ -1,26 +1,26 @@
 """VibeFinder AI — LLM agent with RAG, agentic planning, and few-shot specialization.
 
+Powered by Google Gemini API (gemini-2.0-flash).
+
 Stretch features implemented here
 ──────────────────────────────────
 RAG Enhancement (+2)
   A second knowledge-base document (data/knowledge_base.md) is loaded at startup
-  and injected as a second cached system-prompt block alongside the song catalog.
+  and appended to the system prompt alongside the song catalog.
   It contains genre profiles, mood psychology, activity→music mappings, and signal
-  reference tables. Claude references it to give richer explanations for genres and
+  reference tables. Gemini references it to give richer explanations for genres and
   moods that the catalog labels alone cannot fully capture.
 
 Agentic Workflow Enhancement (+2)
-  A `plan_search` tool is added. Claude calls it *before* get_recommendations when
+  A `plan_search` tool is added. Gemini calls it *before* get_recommendations when
   the query is ambiguous or complex. Each call is logged and its input is stored in
   `reasoning_steps` alongside every other tool call, making the full decision chain
   observable. The Streamlit UI renders these steps in an expandable panel.
 
 Fine-Tuning / Specialization (+2)
-  Three few-shot examples are appended to the static system prompt. They constrain
-  Claude to: always cite numeric scores, format each song as "🎵 Title by Artist
-  (score/max) — signals", and close with a follow-up offer. Responses with the
-  examples differ measurably from a bare instruction prompt — the voice is
-  consistently score-transparent and music-enthusiast rather than generic.
+  Three few-shot examples are appended to the system prompt. They constrain
+  Gemini to: always cite numeric scores, format each song as "🎵 Title by Artist
+  (score/max) — signals", and close with a follow-up offer.
 """
 
 from __future__ import annotations
@@ -29,7 +29,8 @@ import logging
 import os
 from typing import Any
 
-import anthropic
+from google import genai
+from google.genai import types
 
 from .recommender import apply_diversity_penalty, load_songs, recommend_songs, score_song
 
@@ -48,89 +49,7 @@ _VALID_MOODS = (
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Tool definitions
-# ──────────────────────────────────────────────────────────────────────────────
-_TOOLS: list[dict] = [
-    {
-        "name": "plan_search",
-        "description": (
-            "Call this FIRST when the user's request is ambiguous, uses activity language "
-            "(e.g. 'gym', 'studying', 'road trip'), or mixes signals that need interpretation. "
-            "State how you read the request and which catalog values you plan to use before "
-            "calling get_recommendations. This step is observable to the user."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "interpretation": {
-                    "type": "string",
-                    "description": "How you read the user's request in plain English.",
-                },
-                "planned_genre": {"type": "string"},
-                "planned_mood": {"type": "string"},
-                "planned_energy": {
-                    "type": "number",
-                    "description": "Target energy 0.0–1.0 you will use.",
-                },
-                "reasoning": {
-                    "type": "string",
-                    "description": "Why you chose these parameters (reference knowledge base if helpful).",
-                },
-            },
-            "required": ["interpretation", "planned_genre", "planned_mood", "planned_energy", "reasoning"],
-        },
-    },
-    {
-        "name": "get_recommendations",
-        "description": (
-            "Query the VibeFinder scoring engine and return top song recommendations. "
-            "Call plan_search first if the query needed interpretation. "
-            "Genre, mood, energy, and likes_acoustic are required."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "genre": {"type": "string", "description": "Must be a catalog genre."},
-                "mood": {"type": "string", "description": "Must be a catalog mood."},
-                "energy": {"type": "number", "description": "Target energy 0.0–1.0."},
-                "likes_acoustic": {"type": "boolean"},
-                "preferred_decade": {"type": "string"},
-                "desired_mood_tags": {"type": "array", "items": {"type": "string"}},
-                "popularity_target": {
-                    "type": "integer",
-                    "description": "Target popularity 0–100; -1 = no preference.",
-                },
-                "wants_instrumental": {"type": "boolean"},
-                "use_diversity": {
-                    "type": "boolean",
-                    "description": "Apply diversity penalty to avoid same-artist repeats.",
-                },
-            },
-            "required": ["genre", "mood", "energy", "likes_acoustic"],
-        },
-    },
-    {
-        "name": "explain_song",
-        "description": (
-            "Return a detailed score breakdown for one specific song. "
-            "Use when the user asks why a track was recommended or wants more detail."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "song_title": {"type": "string", "description": "Title (partial match OK)."},
-                "genre": {"type": "string"},
-                "mood": {"type": "string"},
-                "energy": {"type": "number"},
-                "likes_acoustic": {"type": "boolean"},
-            },
-            "required": ["song_title", "genre", "mood", "energy", "likes_acoustic"],
-        },
-    },
-]
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Static system prompt — cached at the server (cache_control: ephemeral)
+# Static system prompt
 # ──────────────────────────────────────────────────────────────────────────────
 _SYSTEM_CORE = """\
 You are VibeFinder AI, a music recommendation assistant backed by an 18-song catalog \
@@ -161,7 +80,6 @@ CATALOG VALID VALUES
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Few-shot examples — Specialization/Fine-tuning (+2)
-# Appended to the cached system block to constrain voice and format.
 # ──────────────────────────────────────────────────────────────────────────────
 _FEW_SHOT = """
 ─── FEW-SHOT EXAMPLES (follow this exact voice and format) ───────────────────
@@ -212,18 +130,103 @@ def _build_catalog_snapshot(songs: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _build_gemini_tools() -> types.Tool:
+    """Build Gemini FunctionDeclaration tool definitions."""
+    return types.Tool(function_declarations=[
+        types.FunctionDeclaration(
+            name="plan_search",
+            description=(
+                "Call this FIRST when the user's request is ambiguous, uses activity language "
+                "(e.g. 'gym', 'studying', 'road trip'), or mixes signals that need interpretation. "
+                "State how you read the request and which catalog values you plan to use before "
+                "calling get_recommendations. This step is observable to the user."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "interpretation": types.Schema(
+                        type=types.Type.STRING,
+                        description="How you read the user's request in plain English.",
+                    ),
+                    "planned_genre": types.Schema(type=types.Type.STRING),
+                    "planned_mood": types.Schema(type=types.Type.STRING),
+                    "planned_energy": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Target energy 0.0-1.0 you will use.",
+                    ),
+                    "reasoning": types.Schema(
+                        type=types.Type.STRING,
+                        description="Why you chose these parameters (reference knowledge base if helpful).",
+                    ),
+                },
+                required=["interpretation", "planned_genre", "planned_mood", "planned_energy", "reasoning"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="get_recommendations",
+            description=(
+                "Query the VibeFinder scoring engine and return top song recommendations. "
+                "Call plan_search first if the query needed interpretation. "
+                "Genre, mood, energy, and likes_acoustic are required."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "genre": types.Schema(type=types.Type.STRING, description="Must be a catalog genre."),
+                    "mood": types.Schema(type=types.Type.STRING, description="Must be a catalog mood."),
+                    "energy": types.Schema(type=types.Type.NUMBER, description="Target energy 0.0-1.0."),
+                    "likes_acoustic": types.Schema(type=types.Type.BOOLEAN),
+                    "preferred_decade": types.Schema(type=types.Type.STRING),
+                    "desired_mood_tags": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.STRING),
+                    ),
+                    "popularity_target": types.Schema(
+                        type=types.Type.INTEGER,
+                        description="Target popularity 0-100; -1 = no preference.",
+                    ),
+                    "wants_instrumental": types.Schema(type=types.Type.BOOLEAN),
+                    "use_diversity": types.Schema(
+                        type=types.Type.BOOLEAN,
+                        description="Apply diversity penalty to avoid same-artist repeats.",
+                    ),
+                },
+                required=["genre", "mood", "energy", "likes_acoustic"],
+            ),
+        ),
+        types.FunctionDeclaration(
+            name="explain_song",
+            description=(
+                "Return a detailed score breakdown for one specific song. "
+                "Use when the user asks why a track was recommended or wants more detail."
+            ),
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "song_title": types.Schema(type=types.Type.STRING, description="Title (partial match OK)."),
+                    "genre": types.Schema(type=types.Type.STRING),
+                    "mood": types.Schema(type=types.Type.STRING),
+                    "energy": types.Schema(type=types.Type.NUMBER),
+                    "likes_acoustic": types.Schema(type=types.Type.BOOLEAN),
+                },
+                required=["song_title", "genre", "mood", "energy", "likes_acoustic"],
+            ),
+        ),
+    ])
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Agent
 # ──────────────────────────────────────────────────────────────────────────────
 
 class MusicAgent:
-    """Conversational music recommendation agent.
+    """Conversational music recommendation agent powered by Google Gemini.
 
     Stretch features
     ─────────────────
-    RAG Enhancement     — knowledge_base.md loaded as a second cached system block.
+    RAG Enhancement     — knowledge_base.md appended to system prompt.
     Agentic Enhancement — plan_search tool + reasoning_steps property.
-    Specialization      — few-shot examples baked into the static system prompt.
+    Specialization      — few-shot examples baked into the system prompt.
 
     Parameters
     ──────────
@@ -232,38 +235,26 @@ class MusicAgent:
     """
 
     def __init__(self, songs_path: str, knowledge_path: str | None = None) -> None:
-        self._client = anthropic.Anthropic()
+        self._client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
         self.songs = load_songs(songs_path)
-        self._history: list[dict] = []
+        self._history: list[types.Content] = []
         self._last_profile: dict | None = None
         self._reasoning_steps: list[dict] = []
 
-        # Build system blocks (cached at the server)
         catalog = _build_catalog_snapshot(self.songs)
-        block1_text = _SYSTEM_CORE + catalog + _FEW_SHOT
+        self._system_prompt = _SYSTEM_CORE + catalog + _FEW_SHOT
 
-        self._system_blocks: list[dict] = [
-            {
-                "type": "text",
-                "text": block1_text,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
-
-        # RAG Enhancement: inject knowledge base as a second cached block
+        # RAG Enhancement: append knowledge base to system prompt
         if knowledge_path and os.path.exists(knowledge_path):
             with open(knowledge_path, encoding="utf-8") as f:
                 kb_text = f.read()
-            self._system_blocks.append(
-                {
-                    "type": "text",
-                    "text": "\n\nMUSIC KNOWLEDGE BASE (use this to interpret activity language, "
-                            "mood psychology, and give richer explanations):\n\n" + kb_text,
-                    "cache_control": {"type": "ephemeral"},
-                }
+            self._system_prompt += (
+                "\n\nMUSIC KNOWLEDGE BASE (use this to interpret activity language, "
+                "mood psychology, and give richer explanations):\n\n" + kb_text
             )
             logger.info("knowledge_base_loaded", extra={"chars": len(kb_text)})
 
+        self._tools = _build_gemini_tools()
         logger.info("agent_initialized", extra={"catalog_size": len(self.songs),
                                                  "kb": knowledge_path is not None})
 
@@ -355,53 +346,73 @@ class MusicAgent:
 
     def chat(self, user_message: str) -> str:
         """Process one user turn. Returns the assistant's final text reply."""
-        self._history.append({"role": "user", "content": user_message})
+        self._history.append(
+            types.Content(role="user", parts=[types.Part.from_text(user_message)])
+        )
         self._reasoning_steps = []
         logger.info("user_message", extra={"message": user_message[:300]})
 
-        for iteration in range(8):  # safety cap — allows plan→recommend→explain
-            response = self._client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=1024,
-                system=self._system_blocks,
-                tools=_TOOLS,
-                messages=self._history,
-                extra_headers={"anthropic-beta": "prompt-caching-2024-07-31"},
+        for iteration in range(8):
+            response = self._client.models.generate_content(
+                model="gemini-2.0-flash",
+                contents=self._history,
+                config=types.GenerateContentConfig(
+                    tools=[self._tools],
+                    system_instruction=self._system_prompt,
+                    max_output_tokens=1024,
+                ),
             )
+
+            if not response.candidates:
+                logger.warning("no_candidates", extra={"iteration": iteration})
+                break
+
+            candidate = response.candidates[0]
+            content = candidate.content
+            self._history.append(content)
+
             logger.info(
                 "llm_turn",
                 extra={
                     "iteration": iteration,
-                    "stop_reason": response.stop_reason,
-                    "input_tokens": response.usage.input_tokens,
-                    "output_tokens": response.usage.output_tokens,
+                    "finish_reason": str(candidate.finish_reason),
+                    "input_tokens": response.usage_metadata.prompt_token_count if response.usage_metadata else None,
+                    "output_tokens": response.usage_metadata.candidates_token_count if response.usage_metadata else None,
                 },
             )
 
-            if response.stop_reason == "end_turn":
-                text = next(
-                    (b.text for b in response.content if hasattr(b, "text")), ""
-                )
-                self._history.append({"role": "assistant", "content": response.content})
-                logger.info("assistant_reply", extra={"length": len(text)})
-                return text
+            # Collect any function calls in this response
+            function_calls = [
+                p for p in (content.parts or [])
+                if p.function_call and p.function_call.name
+            ]
 
-            if response.stop_reason == "tool_use":
-                self._history.append({"role": "assistant", "content": response.content})
-                tool_results = [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": self._run_tool(block.name, block.input),
-                    }
-                    for block in response.content
-                    if block.type == "tool_use"
-                ]
-                self._history.append({"role": "user", "content": tool_results})
+            if function_calls:
+                tool_result_parts = []
+                for part in function_calls:
+                    fc = part.function_call
+                    result = self._run_tool(fc.name, dict(fc.args))
+                    tool_result_parts.append(
+                        types.Part(
+                            function_response=types.FunctionResponse(
+                                name=fc.name,
+                                response={"result": result},
+                            )
+                        )
+                    )
+                self._history.append(
+                    types.Content(role="user", parts=tool_result_parts)
+                )
                 continue
 
-            logger.warning("unexpected_stop", extra={"stop_reason": response.stop_reason})
-            break
+            # No function calls — extract text and return
+            text_parts = [
+                p.text for p in (content.parts or [])
+                if hasattr(p, "text") and p.text
+            ]
+            text = "\n".join(text_parts)
+            logger.info("assistant_reply", extra={"length": len(text)})
+            return text
 
         return (
             "I'm having trouble completing that request. "

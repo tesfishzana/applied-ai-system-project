@@ -331,8 +331,8 @@ def main() -> None:
     print_engine_report(results)
 
     if args.with_llm:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            print("ERROR: ANTHROPIC_API_KEY not set. Cannot run LLM layer.\n")
+        if not os.environ.get("GEMINI_API_KEY"):
+            print("ERROR: GEMINI_API_KEY not set. Cannot run LLM layer.\n")
             sys.exit(1)
         run_llm_layer()
 
