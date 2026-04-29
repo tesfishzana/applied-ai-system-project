@@ -193,7 +193,7 @@ if prompt := st.chat_input("e.g. Something chill to study to late at night…"):
                 _log.error("agent_error", exc_info=True)
                 reply = (
                     "Sorry, something went wrong. "
-                    "Please check that your `ANTHROPIC_API_KEY` is valid and try again."
+                    "Please check that your `GEMINI_API_KEY` is valid and try again."
                 )
                 steps = []
 

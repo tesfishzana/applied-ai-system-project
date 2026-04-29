@@ -316,7 +316,7 @@ class MusicAgent:
         """Process one user turn. Returns the assistant's final text reply."""
         self._history.append({"role": "user", "content": user_message})
         self._reasoning_steps = []
-        logger.info("user_message", extra={"message": user_message[:300]})
+        logger.info("user_message", extra={"user_msg": user_message[:300]})
 
         messages = [{"role": "system", "content": self._system_prompt}] + self._history
 
