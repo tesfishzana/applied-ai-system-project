@@ -3,7 +3,17 @@
 > **Original project:** Music Recommender Simulation (Module 3)
 > **Extended into:** Full applied AI system with RAG, agentic workflow, logging, reliability testing, and stretch features
 
-**Ethics & Reflection** → [reflection_ethics.md](reflection_ethics.md)
+**GitHub:** https://github.com/tesfishzana/applied-ai-system-project
+**Demo Video:** [Watch Loom Walkthrough](https://www.loom.com/share/your-loom-link-here) ← replace with your recorded link
+**Ethics & Reflection** → [reflection_ethics.md](ai110-module3show-musicrecommendersimulation-starter/reflection_ethics.md)
+
+---
+
+## Portfolio
+
+**What this project says about me as an AI engineer:**
+
+VibeFinder AI shows that I understand how to build AI systems that are both useful and trustworthy. Instead of treating the LLM as a black box, I separated concerns deliberately: a deterministic scoring engine handles retrieval so every recommendation is testable and auditable, while the language model handles what it does best — parsing intent and explaining results in plain English. I built reliability tests before adding the LLM layer, which meant I caught a subtle diversity-penalty bug through proper test design rather than by accident. I also made honest trade-offs: I documented the genre-dominance bias, acknowledged the catalog's sparsity, and wrote a model card that explains when the system fails — not just when it succeeds. That combination of technical execution, systematic testing, and honest reflection is how I approach applied AI work.
 
 ---
 
