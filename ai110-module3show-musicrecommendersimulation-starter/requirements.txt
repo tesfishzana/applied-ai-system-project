@@ -1,4 +1,4 @@
-google-genai>=1.0.0
+openai>=1.0.0
 pandas
 pytest
 python-dotenv
