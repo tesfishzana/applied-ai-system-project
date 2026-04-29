@@ -9,16 +9,15 @@ Requires:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 
 import streamlit as st
 
-# Allow `from src.X import ...` when launched from the project directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# Load .env if present (optional convenience — never required in production)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -34,6 +33,7 @@ from src.llm_agent import MusicAgent
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SONGS_PATH = os.path.join(_DIR, "data", "songs.csv")
+_KB_PATH = os.path.join(_DIR, "data", "knowledge_base.md")
 _LOGS_DIR = os.path.join(_DIR, "logs")
 
 # ---------------------------------------------------------------------------
@@ -59,11 +59,13 @@ _log = logging.getLogger("vibefinder.app")
 # ---------------------------------------------------------------------------
 
 if "agent" not in st.session_state:
-    st.session_state.agent = MusicAgent(_SONGS_PATH)
-    _log.info("streamlit_session_start")
+    kb = _KB_PATH if os.path.exists(_KB_PATH) else None
+    st.session_state.agent = MusicAgent(_SONGS_PATH, knowledge_path=kb)
+    _log.info("streamlit_session_start", extra={"kb_loaded": kb is not None})
 
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # [{"role": "user"|"assistant", "content": str}]
+    # Each entry: {"role": str, "content": str, "steps": list|None}
+    st.session_state.messages = []
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -84,15 +86,10 @@ with st.sidebar:
 
     st.divider()
 
-    # Show the most recently extracted preference profile
     last = st.session_state.agent.last_profile
     if last:
         st.subheader("Detected profile")
-        display = {
-            k: v
-            for k, v in last.items()
-            if v not in (None, "", [], -1, False)
-        }
+        display = {k: v for k, v in last.items() if v not in (None, "", [], -1, False)}
         st.json(display, expanded=True)
     else:
         st.info("No profile detected yet.\nAsk for a recommendation to see your preferences here.")
@@ -103,21 +100,22 @@ with st.sidebar:
         st.markdown(
             """
 **RAG pipeline**
-1. You describe what you want to hear in plain English.
-2. Claude calls the `get_recommendations` tool with extracted preferences.
+1. Your query → Claude interprets it using the music knowledge base.
+2. Claude calls `get_recommendations` with extracted preferences.
 3. The VibeFinder scoring engine scores all 18 catalog songs.
-4. Claude explains the top results using the actual scores as grounding.
+4. Claude explains results using actual scores — no hallucinated data.
 
-**Agentic refinement**
-Say *"make it more energetic"*, *"I don't like that artist"*, or
-*"explain the first song"* — Claude will call the tools again and
-refine the results across multiple turns.
+**Agentic planning**
+For activity-based queries ("gym", "studying"), Claude calls `plan_search`
+first to show its reasoning, then searches the catalog.
+
+**Multi-turn refinement**
+Say *"make it more energetic"*, *"explain that first song"*, or
+*"try with diversity on"* — Claude refines across turns.
 
 **Scoring signals**
-- Genre match (+2.0) · Mood match (+1.0)
-- Energy fit (+0–1.0) · Acoustic warmth (+0.5)
-- Era / decade (+0.25) · Mood tags (+0.10 each)
-- Popularity fit (+0.20) · Instrumental (+0.25)
+Genre (+2.0) · Mood (+1.0) · Energy fit (+0–1.0) · Acoustic (+0.5)
+Era (+0.25) · Tags (+0.10 each) · Popularity (+0.20) · Instrumental (+0.25)
             """
         )
 
@@ -129,38 +127,46 @@ refine the results across multiple turns.
             st.caption(f"{size_kb:.1f} KB written")
 
 # ---------------------------------------------------------------------------
-# Main area — header
+# Main area
 # ---------------------------------------------------------------------------
 
 st.title("🎵 VibeFinder AI")
 st.caption(
-    "Describe the music you're in the mood for and I'll find the perfect tracks "
-    "from the catalog. You can refine results across multiple turns."
+    "Describe the music you're in the mood for — genre, vibe, activity, or feeling. "
+    "I'll find the best tracks and explain exactly why they fit."
 )
-
-# ---------------------------------------------------------------------------
-# API key guard
-# ---------------------------------------------------------------------------
 
 if not os.environ.get("ANTHROPIC_API_KEY"):
     st.error(
         "**ANTHROPIC_API_KEY is not set.**\n\n"
-        "Add it to your environment before running:\n"
         "```\nexport ANTHROPIC_API_KEY=sk-ant-...\nstreamlit run app.py\n```\n"
-        "Or create a `.env` file in the project directory containing:\n"
-        "```\nANTHROPIC_API_KEY=sk-ant-...\n```"
+        "Or create a `.env` file:\n```\nANTHROPIC_API_KEY=sk-ant-...\n```"
     )
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Render chat history
+# Render chat history (with optional reasoning steps expanders)
 # ---------------------------------------------------------------------------
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        # Show agentic reasoning steps stored with this message
+        steps = msg.get("steps") or []
+        if steps:
+            with st.expander(f"🔍 Reasoning steps ({len(steps)} tool call{'s' if len(steps) != 1 else ''})"):
+                for i, step in enumerate(steps, 1):
+                    st.markdown(f"**Step {i} — `{step['tool']}`**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.caption("Input")
+                        st.json(step["input"], expanded=False)
+                    with col2:
+                        st.caption("Output")
+                        st.text(step["output"][:400] + ("…" if len(step["output"]) > 400 else ""))
+                    if i < len(steps):
+                        st.divider()
 
-# Show a welcome message when the conversation is empty
 if not st.session_state.messages:
     with st.chat_message("assistant"):
         st.markdown(
@@ -174,23 +180,39 @@ if not st.session_state.messages:
 # ---------------------------------------------------------------------------
 
 if prompt := st.chat_input("e.g. Something chill to study to late at night…"):
-    # Display user message immediately
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.messages.append({"role": "user", "content": prompt, "steps": None})
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Call the agent and render its reply
     with st.chat_message("assistant"):
         with st.spinner("Finding your vibe…"):
             try:
                 reply = st.session_state.agent.chat(prompt)
+                steps = st.session_state.agent.reasoning_steps
             except Exception:
                 _log.error("agent_error", exc_info=True)
                 reply = (
-                    "Sorry, something went wrong while contacting the AI service. "
+                    "Sorry, something went wrong. "
                     "Please check that your `ANTHROPIC_API_KEY` is valid and try again."
                 )
+                steps = []
+
         st.markdown(reply)
 
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+        # Render reasoning steps inline after the reply
+        if steps:
+            with st.expander(f"🔍 Reasoning steps ({len(steps)} tool call{'s' if len(steps) != 1 else ''})"):
+                for i, step in enumerate(steps, 1):
+                    st.markdown(f"**Step {i} — `{step['tool']}`**")
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.caption("Input")
+                        st.json(step["input"], expanded=False)
+                    with col2:
+                        st.caption("Output")
+                        st.text(step["output"][:400] + ("…" if len(step["output"]) > 400 else ""))
+                    if i < len(steps):
+                        st.divider()
+
+    st.session_state.messages.append({"role": "assistant", "content": reply, "steps": steps})
     st.rerun()

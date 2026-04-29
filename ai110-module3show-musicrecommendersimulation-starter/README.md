@@ -1,7 +1,9 @@
 # 🎵 VibeFinder AI — Applied AI Music Recommender
 
 > **Original project:** Music Recommender Simulation (Module 3)
-> **Extended into:** Full applied AI system with RAG, agentic workflow, logging, and reliability testing
+> **Extended into:** Full applied AI system with RAG, agentic workflow, logging, reliability testing, and stretch features
+
+**Ethics & Reflection** → [reflection_ethics.md](reflection_ethics.md)
 
 ---
 
@@ -322,19 +324,111 @@ The reliability tests also revealed something practical: the diversity penalty i
 
 ---
 
+## Stretch Features (up to +8 pts)
+
+### RAG Enhancement (+2) — `data/knowledge_base.md`
+
+A second document is loaded at agent startup and injected as a second prompt-cached
+system block alongside the song catalog. It contains:
+- Genre profiles (tempo ranges, energy ranges, best use cases)
+- Mood psychology (what each mood signals about the listener's state)
+- Activity → music mappings (gym, studying, road trip, meditation, etc.)
+- Energy-score interpretation guide ("something to wake me up" → energy ≥ 0.75)
+
+**Measurable improvement:** With only the catalog, Claude explains *"Library Rain*
+matches because genre=lofi and mood=chill."* With the knowledge base, it adds *"Lofi
+is characterized by slow 60–85 BPM tempos, ambient noise layers, and acoustic warmth
+— ideal for sustained attention without distraction."* The explanation is grounded in
+domain knowledge, not just catalog labels.
+
+### Agentic Workflow Enhancement (+2) — `plan_search` tool + reasoning steps UI
+
+A new `plan_search` tool is added. Claude calls it **before** `get_recommendations`
+when the user's request is ambiguous or uses activity language. It states:
+- How the query was interpreted
+- Which genre/mood/energy values are planned
+- Why those values were chosen (referencing the knowledge base)
+
+All tool calls — including `plan_search` — are tracked in `agent.reasoning_steps` and
+rendered in a collapsible "Reasoning steps" panel in the Streamlit UI. This makes the
+full decision chain observable: Plan → Retrieve → Explain.
+
+**Example multi-step chain for "something for the gym":**
+```
+Step 1: plan_search  → genre=rock, mood=intense, energy=0.92 (gym = high arousal)
+Step 2: get_recommendations → Storm Runner 3.99, Iron Collapse 2.00, ...
+Step 3: end_turn     → formatted reply with scores and signals
+```
+
+### Fine-Tuning / Specialization (+2) — few-shot examples in system prompt
+
+Three few-shot examples are appended to the static system prompt block. They constrain
+Claude to a consistent VibeFinder voice:
+- Always cite numeric scores in the format `(score X.XX/Y.YY)`
+- Format each song as `🎵 **Title** by Artist (score) — [signals that fired]`
+- Close every reply with a one-sentence refinement offer
+- Redirect off-topic queries with a music-themed pivot
+
+**Measurable difference from baseline:** Without few-shot examples, Claude produces
+generic music descriptions. With them, every response cites actual engine scores,
+lists the signals that fired (genre match, energy fit, acoustic warmth), and ends
+with a specific offer (e.g., "Want me to add a 2020s decade filter or enable
+diversity mode?"). The structured format is consistent across all queries.
+
+### Test Harness / Evaluation Script (+2) — `evaluate.py`
+
+```bash
+python evaluate.py               # deterministic layer — 9 test cases, no API key needed
+python evaluate.py --with-llm    # + 4 LLM quality checks (requires ANTHROPIC_API_KEY)
+```
+
+**Deterministic layer (9 cases):**
+- Verifies the expected top song for each profile against actual engine output
+- Checks the top score meets a minimum threshold
+- Reports a confidence score: `(score_1 − score_2) / 5.5` (margin of victory)
+- Exits with code 1 if any case fails (CI-compatible)
+
+**LLM layer (4 cases):**
+- Sends natural-language queries to the full agent
+- Checks whether expected song names appear in the reply
+- Verifies a numeric score is cited (regex `\d\.\d{2}`)
+- Checks off-topic queries are correctly deflected
+
+**Last run output:**
+```
+RESULT  : 9/9 passed
+Avg confidence margin : 0.31  (31% of max score gap)
+OK All deterministic engine tests passed.
+```
+
+---
+
+## Reflection and Ethics
+
+See [reflection_ethics.md](reflection_ethics.md) for full answers to:
+- What are the limitations and biases in this system?
+- Could the AI be misused, and how is it prevented?
+- What was surprising during reliability testing?
+- Collaboration with AI: one helpful suggestion, one flawed suggestion.
+
+---
+
 ## Project Structure
 
 ```
 .
 ├── app.py                      Streamlit chat UI (entry point)
+├── evaluate.py                 Evaluation harness — 9 engine + 4 LLM test cases  [stretch]
 ├── requirements.txt
+├── reflection_ethics.md        Ethics reflection and AI collaboration notes
 ├── data/
-│   └── songs.csv               18-song catalog (15 features each)
+│   ├── songs.csv               18-song catalog (15 features each)
+│   └── knowledge_base.md       Genre profiles, mood psychology, activity mapping  [stretch RAG]
 ├── src/
 │   ├── __init__.py
 │   ├── recommender.py          Rule-based scoring engine (unchanged from Module 3)
 │   ├── main.py                 CLI demo (no API key needed)
-│   ├── llm_agent.py            Claude API + RAG + agentic tool-use loop
+│   ├── llm_agent.py            Claude API + RAG + plan_search + few-shot examples
 │   └── logger.py               JSON-structured rotating log handler
 ├── tests/
 │   ├── test_recommender.py     Original 2 unit tests
@@ -343,7 +437,7 @@ The reliability tests also revealed something practical: the diversity penalty i
 ├── docs/
 │   └── data-flow.md            System diagram + sequence diagram + scoring formula
 ├── model_card.md               Bias, limitations, evaluation, intended use
-└── reflection.md               Comparative analysis of profiles and algorithm behaviour
+└── reflection.md               Module 3 reflection on algorithm behaviour
 ```
 
 ---

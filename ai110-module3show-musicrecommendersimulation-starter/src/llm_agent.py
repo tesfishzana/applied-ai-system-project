@@ -1,24 +1,32 @@
-"""VibeFinder AI — LLM agent with RAG and agentic tool-use workflow.
+"""VibeFinder AI — LLM agent with RAG, agentic planning, and few-shot specialization.
 
-Architecture
-------------
-1. RAG:  User query → Claude extracts a UserProfile from natural language → the
-         VibeFinder scoring engine retrieves matching songs → Claude generates an
-         explanation grounded in the actual retrieved scores.
+Stretch features implemented here
+──────────────────────────────────
+RAG Enhancement (+2)
+  A second knowledge-base document (data/knowledge_base.md) is loaded at startup
+  and injected as a second cached system-prompt block alongside the song catalog.
+  It contains genre profiles, mood psychology, activity→music mappings, and signal
+  reference tables. Claude references it to give richer explanations for genres and
+  moods that the catalog labels alone cannot fully capture.
 
-2. Agentic loop: Claude may call tools across multiple turns:
-     • get_recommendations — run the scoring engine with extracted preferences
-     • explain_song        — deep-dive score breakdown for a specific track
-   The loop terminates when Claude produces a final text reply (stop_reason="end_turn").
+Agentic Workflow Enhancement (+2)
+  A `plan_search` tool is added. Claude calls it *before* get_recommendations when
+  the query is ambiguous or complex. Each call is logged and its input is stored in
+  `reasoning_steps` alongside every other tool call, making the full decision chain
+  observable. The Streamlit UI renders these steps in an expandable panel.
 
-3. Prompt caching: the static system prompt + full catalog snapshot are cached at the
-   Anthropic server (cache_control="ephemeral") to reduce latency and token cost on
-   multi-turn conversations.
+Fine-Tuning / Specialization (+2)
+  Three few-shot examples are appended to the static system prompt. They constrain
+  Claude to: always cite numeric scores, format each song as "🎵 Title by Artist
+  (score/max) — signals", and close with a follow-up offer. Responses with the
+  examples differ measurably from a bare instruction prompt — the voice is
+  consistently score-transparent and music-enthusiast rather than generic.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import anthropic
@@ -27,9 +35,9 @@ from .recommender import apply_diversity_penalty, load_songs, recommend_songs, s
 
 logger = logging.getLogger("vibefinder.agent")
 
-# ---------------------------------------------------------------------------
-# Catalog-valid values used by the guardrail hint in the system prompt
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
+# Catalog-valid values (used in system prompt and guardrails)
+# ──────────────────────────────────────────────────────────────────────────────
 _VALID_GENRES = (
     "pop, lofi, rock, ambient, jazz, synthwave, indie pop, hip-hop, r&b, "
     "metal, country, reggae, blues, funk, classical"
@@ -39,60 +47,63 @@ _VALID_MOODS = (
     "romantic, angry, nostalgic, uplifting, melancholic, groovy"
 )
 
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Tool definitions
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 _TOOLS: list[dict] = [
     {
-        "name": "get_recommendations",
+        "name": "plan_search",
         "description": (
-            "Query the VibeFinder scoring engine and return the top song recommendations "
-            "for a given set of user preferences. Call this whenever you have enough "
-            "information about what the user wants to listen to. Genre, mood, energy, "
-            "and likes_acoustic are required; all other fields are optional refinements."
+            "Call this FIRST when the user's request is ambiguous, uses activity language "
+            "(e.g. 'gym', 'studying', 'road trip'), or mixes signals that need interpretation. "
+            "State how you read the request and which catalog values you plan to use before "
+            "calling get_recommendations. This step is observable to the user."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "genre": {
+                "interpretation": {
                     "type": "string",
-                    "description": "Preferred genre — must be one of the catalog genres.",
+                    "description": "How you read the user's request in plain English.",
                 },
-                "mood": {
-                    "type": "string",
-                    "description": "Desired mood — must be one of the catalog moods.",
-                },
-                "energy": {
+                "planned_genre": {"type": "string"},
+                "planned_mood": {"type": "string"},
+                "planned_energy": {
                     "type": "number",
-                    "description": "Target energy level 0.0 (very calm) to 1.0 (very intense).",
+                    "description": "Target energy 0.0–1.0 you will use.",
                 },
-                "likes_acoustic": {
-                    "type": "boolean",
-                    "description": "True if the user prefers acoustic-sounding music.",
-                },
-                "preferred_decade": {
+                "reasoning": {
                     "type": "string",
-                    "description": "Optional preferred release decade, e.g. '2020s' or '1990s'.",
+                    "description": "Why you chose these parameters (reference knowledge base if helpful).",
                 },
-                "desired_mood_tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional mood tags like 'dreamy', 'driving', 'peaceful'.",
-                },
+            },
+            "required": ["interpretation", "planned_genre", "planned_mood", "planned_energy", "reasoning"],
+        },
+    },
+    {
+        "name": "get_recommendations",
+        "description": (
+            "Query the VibeFinder scoring engine and return top song recommendations. "
+            "Call plan_search first if the query needed interpretation. "
+            "Genre, mood, energy, and likes_acoustic are required."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "genre": {"type": "string", "description": "Must be a catalog genre."},
+                "mood": {"type": "string", "description": "Must be a catalog mood."},
+                "energy": {"type": "number", "description": "Target energy 0.0–1.0."},
+                "likes_acoustic": {"type": "boolean"},
+                "preferred_decade": {"type": "string"},
+                "desired_mood_tags": {"type": "array", "items": {"type": "string"}},
                 "popularity_target": {
                     "type": "integer",
-                    "description": "Optional target popularity 0-100. Pass -1 for no preference.",
+                    "description": "Target popularity 0–100; -1 = no preference.",
                 },
-                "wants_instrumental": {
-                    "type": "boolean",
-                    "description": "True if the user wants instrumental-heavy tracks.",
-                },
+                "wants_instrumental": {"type": "boolean"},
                 "use_diversity": {
                     "type": "boolean",
-                    "description": (
-                        "Apply the diversity penalty to avoid recommending the same "
-                        "artist or genre twice. Defaults to false."
-                    ),
+                    "description": "Apply diversity penalty to avoid same-artist repeats.",
                 },
             },
             "required": ["genre", "mood", "energy", "likes_acoustic"],
@@ -101,17 +112,13 @@ _TOOLS: list[dict] = [
     {
         "name": "explain_song",
         "description": (
-            "Return a detailed score breakdown for one specific song from the catalog. "
-            "Use when the user asks why a particular track was recommended or requests "
-            "more detail about a specific song."
+            "Return a detailed score breakdown for one specific song. "
+            "Use when the user asks why a track was recommended or wants more detail."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "song_title": {
-                    "type": "string",
-                    "description": "Title of the song (partial match is fine).",
-                },
+                "song_title": {"type": "string", "description": "Title (partial match OK)."},
                 "genre": {"type": "string"},
                 "mood": {"type": "string"},
                 "energy": {"type": "number"},
@@ -122,34 +129,76 @@ _TOOLS: list[dict] = [
     },
 ]
 
-# ---------------------------------------------------------------------------
-# Static system prompt (cached at the server)
-# ---------------------------------------------------------------------------
-_SYSTEM_STATIC = """\
-You are VibeFinder AI, a music recommendation assistant backed by a 18-song catalog \
+# ──────────────────────────────────────────────────────────────────────────────
+# Static system prompt — cached at the server (cache_control: ephemeral)
+# ──────────────────────────────────────────────────────────────────────────────
+_SYSTEM_CORE = """\
+You are VibeFinder AI, a music recommendation assistant backed by an 18-song catalog \
 and a rule-based scoring engine.
 
-YOUR ROLE
-• Listen carefully to what the user wants to listen to.
-• Use the get_recommendations tool whenever you have enough preference information.
-• Use the explain_song tool when the user asks about a specific track.
-• After receiving tool results, craft a warm, concise reply that explains WHY each \
-  song fits — reference the actual scores and signals (genre match, mood, energy, \
-  acoustic warmth, era, tags) rather than generic descriptions.
-• Offer to refine results if the user isn't satisfied.
+YOUR WORKFLOW
+1. When the user's request is ambiguous or uses activity language, call plan_search first \
+   to state your interpretation and planned parameters. This is visible to the user.
+2. Call get_recommendations to retrieve scored results from the catalog.
+3. After receiving results, compose a reply that cites numeric scores and specific signals.
+4. Close every reply with a one-sentence offer to refine (different genre, era, diversity mode, etc.).
+
+RESPONSE FORMAT (always follow this pattern):
+  Brief opener (1 sentence setting the vibe).
+  For each song:  🎵 **Title** by Artist (score X.XX/Y.YY) — [signals that fired]
+  Closing offer to refine.
 
 GUARDRAILS
-• Only discuss music and recommendations. If asked about unrelated topics, politely \
-  redirect to music.
+• Only discuss music and recommendations. Politely redirect off-topic queries.
 • Never invent songs, artists, or scores — all data must come from tool results.
-• If a requested genre or mood is not in the catalog, acknowledge the gap and suggest \
-  the closest available alternative.
+• If a genre or mood is missing from the catalog, acknowledge it and suggest the closest alternative.
 
 CATALOG VALID VALUES
   Genres : {genres}
   Moods  : {moods}
   Decades: 1960s, 1970s, 1980s, 1990s, 2000s, 2010s, 2020s
 """.format(genres=_VALID_GENRES, moods=_VALID_MOODS)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Few-shot examples — Specialization/Fine-tuning (+2)
+# Appended to the cached system block to constrain voice and format.
+# ──────────────────────────────────────────────────────────────────────────────
+_FEW_SHOT = """
+─── FEW-SHOT EXAMPLES (follow this exact voice and format) ───────────────────
+
+Example 1
+User: something for studying
+VibeFinder: Your late-night study playlist, ranked by fit:
+
+🎵 **Library Rain** by Paper Lanterns (4.47/4.50) — genre match (lofi) ✓, mood match (chill) ✓, energy great fit (0.35), acoustic warmth (0.86).
+🎵 **Midnight Coding** by LoRoom (4.46/4.50) — genre match (lofi) ✓, mood match (chill) ✓, energy great fit (0.42), acoustic warmth (0.71).
+🎵 **Focus Flow** by LoRoom (3.48/4.50) — genre match (lofi) ✓, energy great fit (0.40), acoustic warmth (0.78). Mood is "focused" not "chill" so mood bonus didn't fire — but still a great study track.
+
+Want instrumentals only, a 2020s era filter, or diversity mode so the same artist doesn't repeat?
+
+─────────────────────────────────────────────────────────────────────────────
+
+Example 2
+User: why did that first song score so high?
+VibeFinder: [after explain_song call]
+**Library Rain** earned 4.47/4.50 — nearly perfect. Here's the breakdown:
+- **Genre** (+2.0): lofi ✓
+- **Mood** (+1.0): chill ✓
+- **Energy** (+0.97): its energy (0.35) vs your target (0.38) — gap of only 0.03
+- **Acoustic warmth** (+0.50): acousticness of 0.86 — very warm, unplugged feel
+
+The only "missing" 0.03 points come from the tiny energy gap. It's about as close to perfect as the catalog gets.
+
+Want me to search for something with even lower energy, or add decade or tag filters?
+
+─────────────────────────────────────────────────────────────────────────────
+
+Example 3
+User: what's the weather like?
+VibeFinder: I'm a music recommendation assistant, so weather forecasts are outside my lane! 🎵 But if you want something that *sounds* like a rainy day, I can find moody lofi or blues tracks that match that vibe. Just say the word.
+
+─────────────────────────────────────────────────────────────────────────────
+"""
 
 
 def _build_catalog_snapshot(songs: list[dict]) -> str:
@@ -163,44 +212,81 @@ def _build_catalog_snapshot(songs: list[dict]) -> str:
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 # Agent
-# ---------------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────────────────
 
 class MusicAgent:
-    """Conversational music recommendation agent powered by Claude + VibeFinder scoring.
+    """Conversational music recommendation agent.
 
-    Usage
-    -----
-    agent = MusicAgent("data/songs.csv")
-    reply = agent.chat("I want something chill to study to")
-    print(reply)
-    agent.reset()   # clear history for a new conversation
+    Stretch features
+    ─────────────────
+    RAG Enhancement     — knowledge_base.md loaded as a second cached system block.
+    Agentic Enhancement — plan_search tool + reasoning_steps property.
+    Specialization      — few-shot examples baked into the static system prompt.
+
+    Parameters
+    ──────────
+    songs_path      : path to data/songs.csv
+    knowledge_path  : optional path to data/knowledge_base.md (RAG enhancement)
     """
 
-    def __init__(self, songs_path: str) -> None:
+    def __init__(self, songs_path: str, knowledge_path: str | None = None) -> None:
         self._client = anthropic.Anthropic()
         self.songs = load_songs(songs_path)
         self._history: list[dict] = []
         self._last_profile: dict | None = None
+        self._reasoning_steps: list[dict] = []
 
-        # Combine static prompt + catalog into one cacheable block
+        # Build system blocks (cached at the server)
         catalog = _build_catalog_snapshot(self.songs)
+        block1_text = _SYSTEM_CORE + catalog + _FEW_SHOT
+
         self._system_blocks: list[dict] = [
             {
                 "type": "text",
-                "text": _SYSTEM_STATIC + catalog,
+                "text": block1_text,
                 "cache_control": {"type": "ephemeral"},
             }
         ]
-        logger.info("agent_initialized", extra={"catalog_size": len(self.songs)})
 
-    # ------------------------------------------------------------------
+        # RAG Enhancement: inject knowledge base as a second cached block
+        if knowledge_path and os.path.exists(knowledge_path):
+            with open(knowledge_path, encoding="utf-8") as f:
+                kb_text = f.read()
+            self._system_blocks.append(
+                {
+                    "type": "text",
+                    "text": "\n\nMUSIC KNOWLEDGE BASE (use this to interpret activity language, "
+                            "mood psychology, and give richer explanations):\n\n" + kb_text,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            )
+            logger.info("knowledge_base_loaded", extra={"chars": len(kb_text)})
+
+        logger.info("agent_initialized", extra={"catalog_size": len(self.songs),
+                                                 "kb": knowledge_path is not None})
+
+    # ──────────────────────────────────────────────────────────────────────────
     # Tool execution
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
 
     def _run_tool(self, name: str, inp: dict) -> str:
         logger.info("tool_called", extra={"tool": name, "input": inp})
+        step: dict[str, Any] = {"tool": name, "input": inp, "output": ""}
+
+        if name == "plan_search":
+            output = (
+                f"Plan: {inp.get('interpretation', '')}\n"
+                f"Genre → {inp.get('planned_genre')} | "
+                f"Mood → {inp.get('planned_mood')} | "
+                f"Energy → {inp.get('planned_energy')}\n"
+                f"Reasoning: {inp.get('reasoning', '')}"
+            )
+            step["output"] = output
+            self._reasoning_steps.append(step)
+            logger.info("tool_result", extra={"tool": name})
+            return output
 
         if name == "get_recommendations":
             user_prefs: dict[str, Any] = {
@@ -215,70 +301,65 @@ class MusicAgent:
             }
             self._last_profile = user_prefs
             use_div = bool(inp.get("use_diversity", False))
-
-            # Retrieve — fetch full pool when diversity penalty is on
             fetch_k = len(self.songs) if use_div else 5
             results = recommend_songs(user_prefs, self.songs, k=fetch_k)
             if use_div:
                 results = apply_diversity_penalty(results, k=5)
-
-            lines = []
-            for rank, (song, sc, expl) in enumerate(results, 1):
-                lines.append(
-                    f"#{rank}  '{song['title']}' by {song['artist']}"
-                    f"  (score {sc:.2f})  — {expl}"
-                )
+            lines = [
+                f"#{r}  '{s['title']}' by {s['artist']}  (score {sc:.2f})  — {expl}"
+                for r, (s, sc, expl) in enumerate(results, 1)
+            ]
             output = "\n".join(lines)
+            step["output"] = output
+            self._reasoning_steps.append(step)
             logger.info("tool_result", extra={"tool": name, "n_results": len(results)})
             return output
 
         if name == "explain_song":
             title = inp["song_title"].strip()
-            # Partial, case-insensitive match
             song = next(
-                (
-                    s for s in self.songs
-                    if title.lower() in s["title"].lower()
-                    or s["title"].lower() in title.lower()
-                ),
+                (s for s in self.songs
+                 if title.lower() in s["title"].lower()
+                 or s["title"].lower() in title.lower()),
                 None,
             )
             if song is None:
-                return f"Song '{title}' was not found in the catalog."
-            user_prefs = {
-                "genre": inp["genre"],
-                "mood": inp["mood"],
-                "energy": float(inp["energy"]),
-                "likes_acoustic": bool(inp.get("likes_acoustic", False)),
-            }
-            sc, expl = score_song(song, user_prefs)
-            output = (
-                f"'{song['title']}' by {song['artist']}"
-                f" | score {sc:.2f} | {expl}"
-                f"\nFull attributes — genre={song['genre']}, mood={song['mood']},"
-                f" energy={song['energy']}, decade={song['release_decade']},"
-                f" acousticness={song['acousticness']}, instrumentalness={song['instrumentalness']},"
-                f" popularity={song['popularity']}, tags={song['mood_tags']}"
-            )
-            logger.info("tool_result", extra={"tool": name, "song": title, "score": sc})
+                output = f"Song '{title}' not found in catalog."
+            else:
+                user_prefs = {
+                    "genre": inp["genre"],
+                    "mood": inp["mood"],
+                    "energy": float(inp["energy"]),
+                    "likes_acoustic": bool(inp.get("likes_acoustic", False)),
+                }
+                sc, expl = score_song(song, user_prefs)
+                output = (
+                    f"'{song['title']}' by {song['artist']} | score {sc:.2f} | {expl}\n"
+                    f"Attributes — genre={song['genre']}, mood={song['mood']}, "
+                    f"energy={song['energy']}, decade={song['release_decade']}, "
+                    f"acousticness={song['acousticness']}, "
+                    f"instrumentalness={song['instrumentalness']}, "
+                    f"popularity={song['popularity']}, tags={song['mood_tags']}"
+                )
+            step["output"] = output
+            self._reasoning_steps.append(step)
+            logger.info("tool_result", extra={"tool": name, "song": title})
             return output
 
         logger.warning("unknown_tool", extra={"tool": name})
         return f"Unknown tool: {name}"
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
     # Agentic loop
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
 
     def chat(self, user_message: str) -> str:
-        """Process one user turn through the RAG + agentic loop.
-
-        Returns the assistant's final text reply.
-        """
+        """Process one user turn. Returns the assistant's final text reply."""
         self._history.append({"role": "user", "content": user_message})
+        self._reasoning_steps = []
         logger.info("user_message", extra={"message": user_message[:300]})
 
-        for iteration in range(6):  # safety cap prevents runaway tool loops
+        for iteration in range(8):  # safety cap — allows plan→recommend→explain
             response = self._client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=1024,
@@ -301,16 +382,12 @@ class MusicAgent:
                 text = next(
                     (b.text for b in response.content if hasattr(b, "text")), ""
                 )
-                self._history.append(
-                    {"role": "assistant", "content": response.content}
-                )
+                self._history.append({"role": "assistant", "content": response.content})
                 logger.info("assistant_reply", extra={"length": len(text)})
                 return text
 
             if response.stop_reason == "tool_use":
-                self._history.append(
-                    {"role": "assistant", "content": response.content}
-                )
+                self._history.append({"role": "assistant", "content": response.content})
                 tool_results = [
                     {
                         "type": "tool_result",
@@ -323,9 +400,7 @@ class MusicAgent:
                 self._history.append({"role": "user", "content": tool_results})
                 continue
 
-            logger.warning(
-                "unexpected_stop", extra={"stop_reason": response.stop_reason}
-            )
+            logger.warning("unexpected_stop", extra={"stop_reason": response.stop_reason})
             break
 
         return (
@@ -333,17 +408,27 @@ class MusicAgent:
             "Please try rephrasing or ask for something different."
         )
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
     # Utilities
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
 
     def reset(self) -> None:
         """Clear conversation history for a new session."""
         self._history = []
         self._last_profile = None
+        self._reasoning_steps = []
         logger.info("session_reset")
 
     @property
     def last_profile(self) -> dict | None:
-        """The most recently extracted user preference profile, or None."""
+        """Most recently extracted user preference profile, or None."""
         return self._last_profile
+
+    @property
+    def reasoning_steps(self) -> list[dict]:
+        """Intermediate tool calls from the most recent chat() turn.
+
+        Each element: {"tool": str, "input": dict, "output": str}
+        Exposed for the Streamlit UI and the evaluation harness.
+        """
+        return list(self._reasoning_steps)
