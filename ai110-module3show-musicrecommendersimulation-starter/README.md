@@ -23,30 +23,41 @@ This project started as **VibeFinder 1.0**, a rule-based music recommendation si
 
 ## Architecture Overview
 
-```
-User (natural language)
-        │
-        ▼
-┌──────────────────┐
-│  Streamlit UI    │   ← Chat interface, session management
-│  app.py          │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐     tool: get_recommendations
-│  MusicAgent      │ ─────────────────────────────▶  VibeFinder Engine
-│  llm_agent.py    │ ◀─────────────────────────────  src/recommender.py
-│                  │     scored results + reasons
-│  Claude API      │
-│  (Sonnet 4.6)    │                                 Song Catalog
-│  + prompt cache  │                                 data/songs.csv
-└──────────────────┘
-         │
-         ▼
- logs/vibefinder.log  (JSON, rotating)
+```mermaid
+flowchart TD
+    U([User / Browser]) -->|"natural language query"| APP
+
+    subgraph UI["Streamlit UI — app.py"]
+        APP[Chat Interface\nsession_state.messages\nsession_state.agent]
+    end
+
+    APP -->|"agent.chat(message)"| AGENT
+
+    subgraph AGENT_BOX["MusicAgent — src/llm_agent.py"]
+        CLAUDE["Claude API\nclaude-sonnet-4-6\nprompt-cached system blocks"]
+        ROUTER[Tool Router\n_run_tool]
+        CLAUDE -->|"tool_use"| ROUTER
+        ROUTER -->|"tool_result"| CLAUDE
+    end
+
+    ROUTER -->|"prefs dict"| ENGINE
+
+    subgraph ENGINE_BOX["VibeFinder Engine — src/recommender.py"]
+        ENGINE["score_song()\nrecommend_songs()\napply_diversity_penalty()"]
+    end
+
+    ENGINE -->|"(song, score, reason)[]"| ROUTER
+    ENGINE --- CSV[(data/songs.csv\n18 songs)]
+    CLAUDE --- KB[(data/knowledge_base.md\nRAG context)]
+
+    AGENT_BOX -->|"reply + reasoning_steps"| APP
+    APP -->|"formatted reply"| U
+
+    ENGINE_BOX --- LOG["logs/vibefinder.log\nJSON rotating"]
+    AGENT_BOX --- LOG
 ```
 
-The full diagram with Mermaid source, sequence diagram, and scoring formula is in [docs/data-flow.md](docs/data-flow.md).
+Full diagram with ASCII component map, sequence diagram, and scoring formula: [assets/system-diagram.md](assets/system-diagram.md)
 
 **RAG pattern:** The VibeFinder scoring engine acts as the retriever. Claude uses the retrieved songs (with real scores) as context to generate grounded explanations — it cannot invent songs or scores.
 
@@ -421,6 +432,10 @@ See [reflection_ethics.md](reflection_ethics.md) for full answers to:
 ├── evaluate.py                 Evaluation harness — 9 engine + 4 LLM test cases  [stretch]
 ├── requirements.txt
 ├── reflection_ethics.md        Ethics reflection and AI collaboration notes
+├── assets/
+│   ├── system-diagram.md       Full system architecture (ASCII + Mermaid + sequence)
+│   ├── screenshot-cli-lofi.png CLI demo — Chill Lofi profile
+│   └── screenshot-cli-pop.png  CLI demo — Weekend Vibes profile
 ├── data/
 │   ├── songs.csv               18-song catalog (15 features each)
 │   └── knowledge_base.md       Genre profiles, mood psychology, activity mapping  [stretch RAG]
@@ -435,8 +450,8 @@ See [reflection_ethics.md](reflection_ethics.md) for full answers to:
 │   └── test_reliability.py     18 reliability and guardrail tests
 ├── logs/                       Created at runtime — JSON log lines
 ├── docs/
-│   └── data-flow.md            System diagram + sequence diagram + scoring formula
-├── model_card.md               Bias, limitations, evaluation, intended use
+│   └── data-flow.md            Supplementary data flow notes
+├── model_card.md               Bias, limitations, AI collaboration, testing results
 └── reflection.md               Module 3 reflection on algorithm behaviour
 ```
 
@@ -444,5 +459,5 @@ See [reflection_ethics.md](reflection_ethics.md) for full answers to:
 
 ## Screenshots
 
-![CLI output showing Weekend Vibes profile](<Screenshot 2026-04-12 190922.png>)
-![CLI output showing Chill Lofi profile](<Screenshot 2026-04-12 185358.png>)
+![CLI output showing Weekend Vibes profile](assets/screenshot-cli-pop.png)
+![CLI output showing Chill Lofi profile](assets/screenshot-cli-lofi.png)
