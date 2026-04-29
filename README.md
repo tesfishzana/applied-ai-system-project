@@ -4,7 +4,7 @@
 > **Extended into:** Full applied AI system with RAG, agentic workflow, logging, reliability testing, and stretch features
 
 **GitHub:** https://github.com/tesfishzana/applied-ai-system-project
-**Demo Video:** [Watch Loom Walkthrough](https://www.loom.com/share/your-loom-link-here) ← replace with your recorded link
+**Demo Video:** https://docs.google.com/document/d/12SaDGKGBYwhX2XTBSCS2RpKRFs_QrGu1AFvSQQizLjA/edit?usp=sharing 
 **Ethics & Reflection** → [reflection_ethics.md](ai110-module3show-musicrecommendersimulation-starter/reflection_ethics.md)
 
 ---
