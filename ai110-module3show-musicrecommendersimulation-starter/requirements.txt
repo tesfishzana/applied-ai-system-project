@@ -1,0 +1,6 @@
+anthropic>=0.40.0
+pandas
+pytest
+python-dotenv
+streamlit
+tabulate
